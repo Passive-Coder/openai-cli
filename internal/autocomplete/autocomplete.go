@@ -314,7 +314,7 @@ func getAllPossibleCompletions(completionStyle CompletionStyle, root *cli.Comman
 
 func ExecuteShellCompletion(ctx context.Context, cmd *cli.Command) error {
 	root := cmd.Root()
-	args := rebuildColonSeparatedArgs(root.Args().Slice()[1:])
+	args := rebuildColonSeparatedArgs(root, root.Args().Slice()[1:])
 
 	var completionStyle CompletionStyle
 	if style, ok := os.LookupEnv("COMPLETION_STYLE"); ok {
@@ -352,24 +352,25 @@ func ExecuteShellCompletion(ctx context.Context, cmd *cli.Command) error {
 	return cli.Exit("", int(result.Behavior))
 }
 
-// When CLI arguments are passed in, they are separated on word barriers.
-// Most commonly this is whitespace but in some cases that may also be colons.
-// We wish to allow arguments with colons. To handle this, we append/prepend colons to their neighboring
-// arguments.
-//
-// Example: `rebuildColonSeparatedArgs(["a", "b", ":", "c", "d"])` => `["a", "b:c", "d"]`
-func rebuildColonSeparatedArgs(args []string) []string {
+// Rejoin colon word breaks for completion. An attached trailing colon only
+// absorbs a following command suffix; flag values retain whitespace boundaries.
+func rebuildColonSeparatedArgs(root *cli.Command, args []string) []string {
 	if len(args) == 0 {
 		return args
 	}
 
 	result := []string{}
+	cmd := root
+	lineage := []*cli.Command{root}
+	flags := completionFlags(lineage)
+	value := false
 	i := 0
 
 	for i < len(args) {
 		current := args[i]
 
-		// Keep joining while the next element is ":" or the current element ends with ":"
+		// Preserve standalone-colon reconstruction. A trailing colon alone is
+		// ambiguous, so only join it when the command tree confirms the prefix.
 		for i+1 < len(args) && (args[i+1] == ":" || strings.HasSuffix(current, ":")) {
 			if args[i+1] == ":" {
 				current += ":"
@@ -379,14 +380,41 @@ func rebuildColonSeparatedArgs(args []string) []string {
 					current += args[i+1]
 					i++
 				}
+			} else if !value && !isFlag(current) && hasChildPrefix(cmd, current+args[i+1]) {
+				i++
+				current += args[i]
 			} else {
 				break
 			}
 		}
 
 		result = append(result, current)
+		if value {
+			value = false
+		} else if isFlag(current) {
+			if flag := findFlag(flags, current); flag != nil {
+				if docFlag, ok := (*flag).(cli.DocGenerationFlag); ok {
+					value = docFlag.TakesValue()
+				}
+			}
+		} else if child := findChild(cmd, current); child != nil {
+			cmd = child
+			lineage = append(lineage, child)
+			flags = completionFlags(lineage)
+		}
 		i++
 	}
 
 	return result
+}
+
+func hasChildPrefix(cmd *cli.Command, prefix string) bool {
+	for _, child := range cmd.Commands {
+		if !child.Hidden && slices.ContainsFunc(child.Names(), func(name string) bool {
+			return strings.HasPrefix(name, prefix)
+		}) {
+			return true
+		}
+	}
+	return false
 }
